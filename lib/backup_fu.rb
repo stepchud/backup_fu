@@ -8,49 +8,46 @@ class BackupFuConfigError < StandardError; end
 class S3ConnectError < StandardError; end
 
 class BackupFu
-  
+
   def initialize
     db_conf = YAML.load_file(File.join(RAILS_ROOT, 'config', 'database.yml')) 
     @db_conf = db_conf[RAILS_ENV].symbolize_keys
-    
+
     raw_config = File.read(File.join(RAILS_ROOT, 'config', 'backup_fu.yml'))
-    erb_config = ERB.new(raw_config).result 
+    erb_config = ERB.new(raw_config).result
     fu_conf    = YAML.load(erb_config)
     @fu_conf   = fu_conf[RAILS_ENV].symbolize_keys
-    
-    @s3_conf = YAML.load_file(File.join(RAILS_ROOT, 'config', 'amazon_s3.yml'))[RAILS_ENV].symbolize_keys
-    @fu_conf[:s3_bucket] ||= @s3_conf[:bucket_name]
-    @fu_conf[:aws_access_key_id] ||= @s3_conf[:access_key_id]
-    @fu_conf[:aws_secret_access_key] ||= @s3_conf[:secret_access_key]
+    [:compress, :encrypt].each{|key| @fu_conf[key] = @fu_conf[key].symbolize_keys if @fu_conf[key]}
 
-    @fu_conf[:mysqldump_options] ||= '--complete-insert --skip-extended-insert'
-    @verbose = !@fu_conf[:verbose].nil?
+    amazon_s3_yaml = File.join(RAILS_ROOT, 'config', 'amazon_s3.yml')
+    if File.exist?(amazon_s3_yaml)
+      @s3_conf = YAML.load_file(amazon_s3_yaml)[RAILS_ENV].symbolize_keys
+      @fu_conf[:s3_bucket] ||= @s3_conf[:bucket_name]
+      @fu_conf[:aws_access_key_id] ||= @s3_conf[:access_key_id]
+      @fu_conf[:aws_secret_access_key] ||= @s3_conf[:secret_access_key]
+    end
+
     @timestamp = datetime_formatted
-    @fu_conf[:keep_backups] ||= 5
+    @verbose = @fu_conf.has_key?(:verbose)
+
+    apply_defaults
     check_conf
     create_dirs
   end
-  
+
   def sqlcmd_options
-    host, port, password = '', '', ''
+    socket, host, port, password = '', '', '', ''
 
-    if @db_conf.has_key?(:host) && @db_conf[:host] != 'localhost'
-      host = "--host=#{@db_conf[:host]}"
-    end
-
-    if @db_conf.has_key?(:port)
-      port = "--port=#{@db_conf[:port]}"
-    end
-
-    unless @db_conf[:username].blank?
-      user = "--user=#{@db_conf[:username]}"
-    end
+    socket = "--socket=#{@db_conf[:socket]}" if @db_conf.has_key?(:socket)
+    host = "--host=#{@db_conf[:host]}" if @db_conf.has_key?(:host) && (@db_conf[:host] != 'localhost')
+    port = "--port=#{@db_conf[:port]}" if @db_conf.has_key?(:port)
+    user = "--user=#{@db_conf[:username]}" unless @db_conf[:username].blank?
 
     if !@db_conf[:password].blank? && @db_conf[:adapter] != 'postgresql'
       password = "--password=#{@db_conf[:password]}"
     end
 
-    "#{host} #{port} #{user} #{password}"
+    "#{socket} #{host} #{port} #{user} #{password}"
   end
 
   def pgpassword_prefix
@@ -60,31 +57,30 @@ class BackupFu
   end
 
   def dump
-    full_dump_path = File.join(dump_base_path, db_filename)
+    db_dump_path = File.join(dump_base_path, db_dump_filename)
     case @db_conf[:adapter]
     when 'postgresql'
-      cmd = niceify "#{pgpassword_prefix} #{dump_path} -i -F c -b #{sqlcmd_options} #{@db_conf[:database]} > #{full_dump_path}"
+      cmd = niceify "#{pgpassword_prefix} #{dump_path} -i -F c -b #{sqlcmd_options} #{@db_conf[:database]} > #{db_dump_path}"
     when 'mysql'
-      cmd = niceify "#{dump_path} #{@fu_conf[:mysqldump_options]} #{sqlcmd_options} #{@db_conf[:database]} > #{full_dump_path}"
+      cmd = niceify "#{dump_path} #{@fu_conf[:mysqldump_options]} #{sqlcmd_options} #{@db_conf[:database]} > #{db_dump_path}"
     end
     puts cmd if @verbose
     `#{cmd}`
 
-    if !@fu_conf[:disable_compression]
-      compress_db(dump_base_path, db_filename) 
-      File.unlink full_dump_path
-    end
+    puts "db_dump_path before compresss & encrypt:#{db_dump_path}"
+    db_dump_path = compress_db(db_dump_path) if @fu_conf[:compress]
+    db_dump_path = encrypt_db(db_dump_path) if @fu_conf[:encrypt]
+    puts "db_dump_path after dump():#{db_dump_path}"
+    return db_dump_path
   end
 
   def backup
-    dump
-    
-    file = final_db_dump_path()
-    puts "\nBacking up to S3: #{file}\n" if @verbose
-    
-    store_file(file)
+    file_path = dump()
+
+    puts "\nBacking up to S3: #{file_path}\n" if @verbose
+    store_file(file_path)
   end
-  
+
   def list_backups
     s3_connection.bucket(@fu_conf[:s3_bucket]).keys.map(&:to_s)
   end
@@ -105,11 +101,11 @@ class BackupFu
 
   def restore_backup(key)
     raise "Restore not implemented for #{@db_conf[:adapter]}" unless @db_conf[:adapter] == 'postgresql'
-    raise 'Restore not implemented for zip' if @fu_conf[:compressor] == 'zip'
-    
-    restore_file_name = @fu_conf[:disable_compression] ? 'restore.sql' : 'restore.tar.gz'
+    raise 'Restore not implemented for zip' if @fu_conf[:compress][:prog] == 'zip'
+
+    restore_file_name = @fu_conf[:compress] ? compressed_filename('restore.sql') : 'restore.sql'
     restore_file = Tempfile.new(restore_file_name)
-    
+
     open(restore_file.path, 'w') do |fh|
       puts "Fetching #{key} to #{restore_file.path}"
       s3_connection.bucket(@fu_conf[:s3_bucket]).get(key) do |chunk|
@@ -117,16 +113,15 @@ class BackupFu
       end
     end
 
-    if(@fu_conf[:disable_compression])
-      restore_file_unpacked = restore_file
-    else
+    if(@fu_conf[:compress])
       restore_file_unpacked = Tempfile.new('restore.sql')
-
       cmd = niceify "tar xfz #{restore_file.path} -O > #{restore_file_unpacked.path}"
       puts "\nUntar: #{cmd}\n" if @verbose
       `#{cmd}`
+    else
+      restore_file_unpacked = restore_file
     end
-    
+
     prepare_db_for_restore
 
     # Do the actual restore
@@ -142,7 +137,7 @@ class BackupFu
   end
 
   ## Static-file Dump/Backup methods
-  
+
   def dump_static
     if !@fu_conf[:static_paths]
       raise BackupFuConfigError, 'No static paths are defined in config/backup_fu.yml.  See README.'
@@ -150,13 +145,13 @@ class BackupFu
     paths = @fu_conf[:static_paths].split(' ')
     compress_static(paths)
   end
-  
+
   def backup_static
     dump_static
-    
+
     file = final_static_dump_path()
     puts "\nBacking up Static files to S3: #{file}\n" if @verbose
-    
+
     store_file(file)
   end
 
@@ -170,8 +165,8 @@ class BackupFu
 
       files_to_remove = backups - backups.last(count)
 
-      if(!@fu_conf[:disable_compression])
-        if(@fu_conf[:compressor] == 'zip')
+      if(@fu_conf[:compress])
+        if(@fu_conf[:compress][:prog] == 'zip')
           files_to_remove = files_to_remove.concat(Dir.glob("#{dump_base_path}/*.{zip}")[0, files_to_remove.length])
         else
           files_to_remove = files_to_remove.concat(Dir.glob("#{dump_base_path}/*.{gz}")[0, files_to_remove.length])
@@ -184,47 +179,61 @@ class BackupFu
 
     end
   end
-  
+
   private
-  
+
   def s3
     @s3 ||= RightAws::S3.new(@fu_conf[:aws_access_key_id],
                              @fu_conf[:aws_secret_access_key])
   end
-  
+
   def s3_bucket
     @s3_bucket ||= s3.bucket(@fu_conf[:s3_bucket], true, 'private')
   end
-  
+
   def store_file(file)
     key = s3_bucket.key(File.basename(file))
     key.data = open(file)
     key.put(nil, 'private')
   end
-  
+
   def s3_connection
     @s3 ||= begin
       RightAws::S3.new(@fu_conf[:aws_access_key_id], @fu_conf[:aws_secret_access_key])
     end
   end
 
-  def check_conf
+  def apply_defaults
+    # Override access keys with environment variables:
     @fu_conf[:s3_bucket] = ENV['s3_bucket'] unless ENV['s3_bucket'].blank?
+    if ENV.keys.include?('AMAZON_ACCESS_KEY_ID') && ENV.keys.include?('AMAZON_SECRET_ACCESS_KEY')
+      @fu_conf[:aws_access_key_id] = ENV['AMAZON_ACCESS_KEY_ID']
+      @fu_conf[:aws_secret_access_key] = ENV['AMAZON_SECRET_ACCESS_KEY']
+    end
+    # mysql defaults
+    @fu_conf[:mysqldump_options] ||= '--complete-insert --skip-extended-insert'
+    # compression defaults to tar.gzip
+    @fu_conf[:compress] ||= {:prog => 'tar'}
+    @fu_conf[:compress][:type] ||= 'gzip'
+    # keep 5 backups around by default
+    @fu_conf[:keep_backups] ||= 5
+  end
+  # raise errors if configuration isn't setup correctly
+  def check_conf
     if @fu_conf[:app_name] == 'replace_me'
       raise BackupFuConfigError, 'Application name (app_name) key not set in config/backup_fu.yml.'
     elsif @fu_conf[:s3_bucket] == 'some-s3-bucket'
       raise BackupFuConfigError, 'S3 bucket (s3_bucket) not set in config/backup_fu.yml.  This bucket must be created using an external S3 tool like S3 Browser for OS X, or JetS3t (Java-based, cross-platform).'
-    else
-      # Check for access keys set as environment variables:
-      if ENV.keys.include?('AMAZON_ACCESS_KEY_ID') && ENV.keys.include?('AMAZON_SECRET_ACCESS_KEY')
-        @fu_conf[:aws_access_key_id] = ENV['AMAZON_ACCESS_KEY_ID']
-        @fu_conf[:aws_secret_access_key] = ENV['AMAZON_SECRET_ACCESS_KEY']
-      elsif @fu_conf[:aws_access_key_id].blank? || @fu_conf[:aws_access_key_id].include?('--replace me') || @fu_conf[:aws_secret_access_key].include?('--replace me')
-        raise BackupFuConfigError, 'AWS Access Key Id or AWS Secret Key not set in config/backup_fu.yml.'
-      end
     end
+    if @fu_conf[:aws_access_key_id].blank? || @fu_conf[:aws_secret_access_key].blank? ||
+         @fu_conf[:aws_access_key_id].include?('--replace me') || @fu_conf[:aws_secret_access_key].include?('--replace me')
+      raise BackupFuConfigError, 'AWS Access Key Id or AWS Secret Key not set in config/backup_fu.yml.'
+    end
+    puts "compress, encrypt:"
+    p @fu_conf[:compress]
+    p @fu_conf[:encrypt]
   end
-  
+
   #! dump_path is totally the wrong name here
   def dump_path
     dump = {:postgresql => 'pg_dump',:mysql => 'mysqldump'}
@@ -238,37 +247,36 @@ class BackupFu
     command
   end
 
+  # where to put the dumped files
   def dump_base_path
     @fu_conf[:dump_base_path] || File.join(RAILS_ROOT, 'tmp', 'backup')
   end
-  
-  def db_filename
+
+  def db_dump_filename
     "#{@fu_conf[:app_name]}_#{ @timestamp }_db.sql"
   end
 
-  def db_filename_compressed
-    if(@fu_conf[:compressor] == 'zip')
-      db_filename.gsub('.sql', '.zip')
+  def compressed_filename(filename)
+    if(@fu_conf[:compress][:prog] == 'zip')
+      filename + '.zip'
     else
-      db_filename.gsub('.sql', '.tar')
+      filename + '.tar'
     end
   end
 
-  def final_db_dump_path
-    if(@fu_conf[:disable_compression])
-      filename = db_filename
+  def encrypted_filename(filename)
+    filename + '.gpg'
+  end
+  def decrypted_filename(filename)
+    if filename =~ /(.+)\.gpg/
+      $1
     else
-      if(@fu_conf[:compressor] == 'zip')
-        filename = db_filename.gsub('.sql', '.zip')
-      else
-        filename = db_filename.gsub('.sql', '.tar.gz')
-      end
+      filename
     end
-    File.join(dump_base_path, filename)
   end
 
   def static_compressed_path
-    if(@fu_conf[:compressor] == 'zip')
+    if(@fu_conf[:compress][:prog] == 'zip')
       f = "#{@fu_conf[:app_name]}_#{ @timestamp }_static.zip"
     else
       f = "#{@fu_conf[:app_name]}_#{ @timestamp }_static.tar"
@@ -277,7 +285,7 @@ class BackupFu
   end
 
   def final_static_dump_path
-    if(@fu_conf[:compressor] == 'zip')
+    if(@fu_conf[:compress][:prog] == 'zip')
       f = "#{@fu_conf[:app_name]}_#{ @timestamp }_static.zip"
     else
       f = "#{@fu_conf[:app_name]}_#{ @timestamp }_static.tar.gz"
@@ -288,11 +296,11 @@ class BackupFu
   def create_dirs
     ensure_directory_exists(dump_base_path)
   end
-  
+
   def ensure_directory_exists(dir)
     FileUtils.mkdir_p(dir) unless File.exist?(dir)
   end
-  
+
   def niceify(cmd)
     if @fu_conf[:enable_nice]
       "nice -n -#{@fu_conf[:nice_level]} #{cmd}"
@@ -304,26 +312,35 @@ class BackupFu
   def datetime_formatted
     Time.now.strftime("%Y-%m-%d") + "_#{ Time.now.tv_sec }"
   end
-  
-  def compress_db(dump_base_path, db_filename)
-    compressed_path = File.join(dump_base_path, db_filename_compressed)
 
-    if(@fu_conf[:compressor] == 'zip')
-      cmd = niceify "zip #{zip_switches} #{compressed_path} #{dump_base_path}/#{db_filename}"
+  # returns: new dump path
+  def compress_db(current_dump_path)
+    new_filename = compressed_filename(File.basename(current_dump_path))
+    compressed_path = File.join(dump_base_path, new_filename)
+
+    if(@fu_conf[:compress][:prog] == 'zip')
+      cmd = niceify "zip #{zip_switches} #{compressed_path} #{dump_base_path}/#{db_dump_filename}"
       puts "\nZip: #{cmd}\n" if @verbose
       `#{cmd}`
-    else
-
-      # TAR it up
-      cmd = niceify "tar -cf #{compressed_path} -C #{dump_base_path} #{db_filename}"
+    else # TAR it up
+      cmd = niceify "tar -c#{tar_compression_switch}f #{compressed_path} -C #{dump_base_path} #{db_dump_filename}"
       puts "\nTar: #{cmd}\n" if @verbose
       `#{cmd}`
-
-      # GZip it up
-      cmd = niceify "gzip -f #{compressed_path}"
-      puts "\nGzip: #{cmd}" if @verbose
-      `#{cmd}`
     end
+
+    # remove original dump file, return new path
+    File.unlink current_dump_path
+    return File.join(dump_base_path, new_filename)
+  end
+
+  # returns: new dump path
+  def encrypt_db(current_dump_path)
+    new_filename = encrypted_filename(File.basename(current_dump_path))
+    encrypt_file(current_dump_path)
+
+    # remove original dump file, return new path
+    # File.unlink current_dump_path
+    return File.join(dump_base_path, new_filename)
   end
 
   def compress_static(paths)
@@ -336,7 +353,7 @@ class BackupFu
 
       puts "Static Path: #{p}" if @verbose
 
-      if @fu_conf[:compressor] == 'zip'
+      if @fu_conf[:compress][:prog] == 'zip'
         cmd = niceify "zip -r #{zip_switch} #{static_compressed_path} #{p}"
         puts "\nZip: #{cmd}\n" if @verbose
         `#{cmd}`
@@ -348,7 +365,7 @@ class BackupFu
         end
 
         # TAR
-        cmd = niceify "tar -#{tar_switch}f #{static_compressed_path} #{p}"
+        cmd = niceify "tar -#{tar_switch}#{tar_compression_switch}f #{static_compressed_path} #{p}"
         puts "\nTar: #{cmd}\n" if @verbose
         `#{cmd}`
 
@@ -362,6 +379,27 @@ class BackupFu
     end
   end
 
+  # currently only aware of gpg
+  def encrypt_file(file_path)
+    cmd = niceify "gpg -e -r '#{@fu_conf[:encrypt][:user]}' #{file_path}"
+    puts "\nGPG: #{cmd}" if @verbose
+    `#{cmd}`
+  end
+
+  # returns: new file path
+  # currently only aware of gpg
+  def unencrypt_file(file_path)
+    decrypted_file_path = decrypted_filename(file_path)
+    cmd = niceify "gpg -d #{file_path} -o #{decrypted_file_path}"
+    puts "\nGPG: #{cmd}" if @verbose
+    `#{cmd}`
+    decrypted_file_path
+  end
+
+  # can specify bzip2 compression, defaults to gzip
+  def tar_compression_switch
+    @fu_conf[:compress][:type] == 'bzip2' ? 'j' : 'z'
+  end
 
   # Add -j option to keep from preserving directory structure
   def zip_switches
@@ -370,7 +408,7 @@ class BackupFu
     else
       password_option = ''
     end
-    
+
     "-j #{password_option}"
   end
 
