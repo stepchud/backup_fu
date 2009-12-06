@@ -31,6 +31,19 @@ Run the following to copy over the example backup_fu.yml config file:
 
 This copies the example config file to: config/backup_fu.yml.
 
+For encryption support, you can run:
+
+  rake backup_fu:setup_encryption
+
+This will generate your encryption files for encrypting the resulting archives. This command runs
+an interactive program (which is just `gpg --gen-key`). You can mostly choose the default values for
+generating this key, or choose your own settings if you are familiar with encrypting with gpg. Of course,
+for this to work you must have a system with gpg already installed. Type `which gpg` to find out if you
+have this command in your path.
+After generating the gpg keys, you must still make changes to your backup_fu.yml file to tell backup_fu
+which user's key to sign the encrypted file with (so you can decrypt it later if needed).
+See vendor/plugins/backup_fu/config/backup_fu.yml.advanced_example for example.
+
 Usage
 =====
 
@@ -69,6 +82,7 @@ Advanced options include:
 * specify fully-qualified 'mysqldump' path
 * disable compression of database dump
 * choose between zip or tar/gzip compression
+* enable encryption on systems with the gpg program available
 * enable 'nice' with level specification to prevent backup_fu from bogarting your server
 
 Cronjob Installation

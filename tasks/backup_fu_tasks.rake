@@ -23,7 +23,13 @@ namespace :backup_fu do
       puts "\nExample backup_fu.yml copied to config/.  Please edit this file before proceeding.\n\nSee 'rake -T backup_fu' for more commands.\n\n"
     end
   end
-  
+  desc "Creates a new gpg key with \`gpg --gen-key\`."
+  task :setup_encryption do
+    puts "Creating a new gpg key for encrypting backups. Will create ~/.gpg dir if it does not exist."
+    `gpg --gen-key`
+    puts "Don't forget to add the config key encrypt[:user] with the name of the gpg user you just created to your backup_fu.yml file."
+    puts  "See backup_fu.yml.advanced_example in the config directory of the backup_fu plugin for an example."
+  end
   desc "Dumps the database locally.  Does *not* upload to S3."
   task :dump do
     b = BackupFu.new
@@ -73,7 +79,7 @@ namespace :backup_fu do
     desc "Zips or Tars and gzips static application files locally.  Does *not* upload to S3."
     task :dump do
       b = BackupFu.new
-      b.dump_static
+      b.dump_static_files
     end
     
     desc "Backups up static files to Amazon S3. For configuration see the backup_fu README."
