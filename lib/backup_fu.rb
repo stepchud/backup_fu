@@ -179,7 +179,6 @@ class BackupFu
 
   def apply_defaults
     # Override access keys with environment variables:
-    @fu_conf[:s3_prefix] ||= ''
     @fu_conf[:s3_bucket] = ENV['s3_bucket'] unless ENV['s3_bucket'].blank?
     if ENV.keys.include?('AMAZON_ACCESS_KEY_ID') && ENV.keys.include?('AMAZON_SECRET_ACCESS_KEY')
       @fu_conf[:aws_access_key_id] = ENV['AMAZON_ACCESS_KEY_ID']
@@ -191,6 +190,9 @@ class BackupFu
     @fu_conf[:compress] ||= {:prog => 'tar'}
     # keep 5 backups around by default
     @fu_conf[:keep_backups] ||= 5
+    # no prefix by default
+    @fu_conf[:s3_db_prefix] ||= ''
+    @fu_conf[:s3_static_prefix] ||= ''
   end
   # raise errors if configuration isn't setup correctly
   def check_conf
@@ -203,9 +205,12 @@ class BackupFu
          @fu_conf[:aws_access_key_id].include?('--replace me') || @fu_conf[:aws_secret_access_key].include?('--replace me')
       raise BackupFuConfigError, 'AWS Access Key Id or AWS Secret Key not set in config/backup_fu.yml.'
     end
-    puts "compress, encrypt:"
-    p @fu_conf[:compress]
-    p @fu_conf[:encrypt]
+    if @fu_conf[:encrypt] && @fu_conf[:encrypt][:user].blank?
+      raise BackupFuConfigError, 'Encryption user key not set as @fu_conf[:encrypt][:user] in config/backup_fu.yml.'
+    end
+    if @fu_conf[:compress].is_a?(Hash) && !['tar','zip'].include?(@fu_conf[:compress][:prog])
+      raise BackupFuConfigError, 'Compression program not recognized.'
+    end
   end
 
   def db_dump_cmd

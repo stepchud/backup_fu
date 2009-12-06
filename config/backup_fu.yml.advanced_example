@@ -10,6 +10,10 @@ aws_secret_access_key: --replace me with your AWS secret access key--
 # Use dynamic bucket path  with erb
 s3_bucket: <%=  %>
 
+# Use prefix for db or static backups on s3 (e.g. to give them their own pseudo-directory structure)
+s3_db_prefix: db/
+s3_static_prefix: static/
+
 backup and compress all app files w/o log/* and tmp/* dirs
 [config sample]
 
@@ -38,8 +42,10 @@ dump_base_path: /tmp
 # You can specify 'compress: false' to skip compression, but WHY?!?
 compress:
   prog: tar
+
+# To enable encryption (run rake backup_fu:setup_encryption first. use the same name user name you created there.)
 encrypt:
-  user: Stephen
+  user: <gpg_user_name_or_unique_part_of_name>
 
 # Password-protect zip files. The password will be omitted if empty.
 # This is a weak protection
