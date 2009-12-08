@@ -35,7 +35,7 @@ For encryption support, you can run:
 
   rake backup_fu:setup_encryption
 
-This will generate your encryption files for encrypting the resulting archives. This command runs
+This will generate the encryption files/keys for encrypting your archives. This command runs
 an interactive program (which is just `gpg --gen-key`). You can mostly choose the default values for
 generating this key, or choose your own settings if you are familiar with encrypting with gpg. Of course,
 for this to work you must have a system with gpg already installed. Type `which gpg` to find out if you
